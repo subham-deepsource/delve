@@ -782,11 +782,10 @@ func setStepIntoBreakpoint(dbp *Target, curfn *Function, text []AsmInstruction, 
 }
 
 func allowDuplicateBreakpoint(bp *Breakpoint, err error) (*Breakpoint, error) {
-	if err != nil {
-		if _, isexists := err.(BreakpointExistsError); isexists {
-			return bp, nil
-		}
+	if _, isexists := err.(BreakpointExistsError); isexists {
+		return bp, nil
 	}
+
 	return bp, err
 }
 
