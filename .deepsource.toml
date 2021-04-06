@@ -9,4 +9,5 @@ name = "go"
 enabled = true
 
   [analyzers.meta]
+  import_root = "github.com/go-delve/delve"
   dependencies_vendored = true
