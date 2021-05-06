@@ -60,8 +60,7 @@ func (inst *x86Inst) Text(flavour AssemblyFlavour, pc uint64, symLookup func(uin
 		text = x86asm.GNUSyntax(x86asm.Inst(*inst), pc, symLookup)
 	case GoFlavour:
 		text = x86asm.GoSyntax(x86asm.Inst(*inst), pc, symLookup)
-	case IntelFlavour:
-		fallthrough
+
 	default:
 		text = x86asm.IntelSyntax(x86asm.Inst(*inst), pc, symLookup)
 	}
