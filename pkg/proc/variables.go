@@ -2219,9 +2219,8 @@ func (v *Variable) ConstDescr() string {
 	}
 
 	switch v.Kind {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		fallthrough
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		n, _ := constant.Int64Val(v.Value)
 		return ctyp.describe(n)
 	}

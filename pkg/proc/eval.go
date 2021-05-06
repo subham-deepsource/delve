@@ -881,21 +881,15 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 		}
 	case *godwarf.FloatType:
 		switch argv.Kind {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			fallthrough
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			fallthrough
-		case reflect.Float32, reflect.Float64:
+
+		case reflect.Float32, reflect.Float64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			v.Value = argv.Value
 			return v, nil
 		}
 	case *godwarf.ComplexType:
 		switch argv.Kind {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			fallthrough
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			fallthrough
-		case reflect.Float32, reflect.Float64:
+
+		case reflect.Float32, reflect.Float64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			v.Value = argv.Value
 			return v, nil
 		}
@@ -1613,13 +1607,8 @@ func (scope *EvalScope) evalBinary(node *ast.BinaryExpr) (*Variable, error) {
 // Both xv and yv must be loaded and have a compatible type (as determined by negotiateType)
 func compareOp(op token.Token, xv *Variable, yv *Variable) (bool, error) {
 	switch xv.Kind {
-	case reflect.Bool:
-		fallthrough
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		fallthrough
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		fallthrough
-	case reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+
+	case reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Bool:
 		return constantCompare(op, xv.Value, yv.Value)
 	case reflect.String:
 		if xv.Len != yv.Len {
