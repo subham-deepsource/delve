@@ -77,9 +77,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/arch/arm64/arm64asm"
-	"golang.org/x/arch/x86/x86asm"
-
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/elfwriter"
 	"github.com/go-delve/delve/pkg/logflags"
@@ -138,8 +135,9 @@ var canUnmaskSignalsCached bool
 // gdbProcess implements proc.Process using a connection to a debugger stub
 // that understands Gdb Remote Serial Protocol.
 type gdbProcess struct {
-	bi   *proc.BinaryInfo
-	conn gdbConn
+	bi       *proc.BinaryInfo
+	regnames *gdbRegnames
+	conn     gdbConn
 
 	threads       map[int]*gdbThread
 	currentThread *gdbThread
@@ -156,6 +154,8 @@ type gdbProcess struct {
 	tracedir       string // if attached to rr the path to the trace directory
 
 	loadGInstrAddr uint64 // address of the g loading instruction, zero if we couldn't allocate it
+
+	breakpointKind int // breakpoint kind to pass to 'z' and 'Z' when creating software breakpoints
 
 	process  *os.Process
 	waitChan chan *os.ProcessState
@@ -196,11 +196,17 @@ type gdbRegisters struct {
 	hasgaddr bool
 	buf      []byte
 	arch     *proc.Arch
+	regnames *gdbRegnames
 }
 
 type gdbRegister struct {
 	value  []byte
 	regnum int
+}
+
+// gdbRegname records names of important CPU registers
+type gdbRegnames struct {
+	PC, SP, BP, CX, FsBase string
 }
 
 // newProcess creates a new Process instance.
@@ -218,10 +224,35 @@ func newProcess(process *os.Process) *gdbProcess {
 		},
 		threads:        make(map[int]*gdbThread),
 		bi:             proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH),
+		regnames:       new(gdbRegnames),
 		breakpoints:    proc.NewBreakpointMap(),
 		gcmdok:         true,
 		threadStopInfo: true,
 		process:        process,
+	}
+
+	switch p.bi.Arch.Name {
+	default:
+		fallthrough
+	case "amd64":
+		p.breakpointKind = 1
+	case "arm64":
+		p.breakpointKind = 4
+	}
+
+	p.regnames.PC = registerName(p.bi.Arch, p.bi.Arch.PCRegNum)
+	p.regnames.SP = registerName(p.bi.Arch, p.bi.Arch.SPRegNum)
+	p.regnames.BP = registerName(p.bi.Arch, p.bi.Arch.BPRegNum)
+
+	switch p.bi.Arch.Name {
+	case "arm64":
+		p.regnames.BP = "fp"
+		p.regnames.CX = "x0"
+	case "amd64":
+		p.regnames.CX = "rcx"
+		p.regnames.FsBase = "fs_base"
+	default:
+		panic("not implemented")
 	}
 
 	if process != nil {
@@ -282,7 +313,7 @@ func (p *gdbProcess) Dial(addr string, path string, pid int, debugInfoDirs []str
 func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.Target, error) {
 	p.conn.conn = conn
 	p.conn.pid = pid
-	err := p.conn.handshake()
+	err := p.conn.handshake(p.regnames)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -299,8 +330,11 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 
 				// Workaround for darwin arm64. Apple's debugserver seems to have a problem
 				// with not selecting the correct thread in the 'g' command and the returned
-				// registers are empty / an E74 error is thrown.
-				if v[len("version:"):] == "1200" && p.bi.Arch.Name == "arm64" {
+				// registers are empty / an E74 error is thrown. This was reported to LLVM
+				// as https://bugs.llvm.org/show_bug.cgi?id=50169
+				version, err := strconv.ParseInt(v[len("version:"):], 10, 32)
+
+				if err == nil && version >= 1200 && version <= 1205 && p.bi.Arch.Name == "arm64" {
 					p.gcmdok = false
 				}
 			}
@@ -696,7 +730,7 @@ func (p *gdbProcess) Valid() (bool, error) {
 		return false, proc.ErrProcessDetached
 	}
 	if p.exited {
-		return false, &proc.ErrProcessExited{Pid: p.Pid()}
+		return false, proc.ErrProcessExited{Pid: p.Pid()}
 	}
 	return true, nil
 }
@@ -746,7 +780,7 @@ const (
 // a breakpoint is hit or signal is received.
 func (p *gdbProcess) ContinueOnce() (proc.Thread, proc.StopReason, error) {
 	if p.exited {
-		return nil, proc.StopExited, &proc.ErrProcessExited{Pid: p.conn.pid}
+		return nil, proc.StopExited, proc.ErrProcessExited{Pid: p.conn.pid}
 	}
 
 	if p.conn.direction == proc.Forward {
@@ -1038,7 +1072,7 @@ func (p *gdbProcess) Restart(pos string) (proc.Thread, error) {
 	p.clearThreadRegisters()
 
 	for addr := range p.breakpoints.M {
-		p.conn.setBreakpoint(addr)
+		p.conn.setBreakpoint(addr, p.breakpointKind)
 	}
 
 	return p.currentThread, p.setCurrentBreakpoints()
@@ -1175,11 +1209,14 @@ func (p *gdbProcess) FindBreakpoint(pc uint64) (*proc.Breakpoint, bool) {
 }
 
 func (p *gdbProcess) WriteBreakpoint(bp *proc.Breakpoint) error {
-	return p.conn.setBreakpoint(bp.Addr)
+	if bp.WatchType != 0 {
+		return errors.New("hardware breakpoints not supported")
+	}
+	return p.conn.setBreakpoint(bp.Addr, p.breakpointKind)
 }
 
 func (p *gdbProcess) EraseBreakpoint(bp *proc.Breakpoint) error {
-	return p.conn.clearBreakpoint(bp.Addr)
+	return p.conn.clearBreakpoint(bp.Addr, p.breakpointKind)
 }
 
 type threadUpdater struct {
@@ -1350,7 +1387,7 @@ func (t *gdbThread) Location() (*proc.Location, error) {
 	if err != nil {
 		return nil, err
 	}
-	if pcreg, ok := regs.(*gdbRegisters).regs[regnamePC]; !ok {
+	if pcreg, ok := regs.(*gdbRegisters).regs[regs.(*gdbRegisters).regnames.PC]; !ok {
 		t.p.conn.log.Errorf("thread %d could not find RIP register", t.ID)
 	} else if len(pcreg.value) < t.p.bi.Arch.PtrSize() {
 		t.p.conn.log.Errorf("thread %d bad length for RIP register: %d", t.ID, len(pcreg.value))
@@ -1400,11 +1437,11 @@ func (t *gdbThread) Common() *proc.CommonThread {
 func (t *gdbThread) StepInstruction() error {
 	pc := t.regs.PC()
 	if _, atbp := t.p.breakpoints.M[pc]; atbp {
-		err := t.p.conn.clearBreakpoint(pc)
+		err := t.p.conn.clearBreakpoint(pc, t.p.breakpointKind)
 		if err != nil {
 			return err
 		}
-		defer t.p.conn.setBreakpoint(pc)
+		defer t.p.conn.setBreakpoint(pc, t.p.breakpointKind)
 	}
 	// Reset thread registers so the next call to
 	// Thread.Registers will not be cached.
@@ -1490,8 +1527,9 @@ func (p *gdbProcess) DumpProcessNotes(notes []elfwriter.Note, threadDone func())
 	return false, notes, nil
 }
 
-func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch) {
+func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch, regnames *gdbRegnames) {
 	regs.arch = arch
+	regs.regnames = regnames
 	regs.regs = make(map[string]gdbRegister)
 	regs.regsInfo = regsInfo
 
@@ -1513,7 +1551,7 @@ func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch) {
 // the stub can allocate memory, or reloadGAtPC, if the stub can't.
 func (t *gdbThread) reloadRegisters() error {
 	if t.regs.regs == nil {
-		t.regs.init(t.p.conn.regsInfo, t.p.bi.Arch)
+		t.regs.init(t.p.conn.regsInfo, t.p.bi.Arch, t.p.regnames)
 	}
 
 	if t.p.gcmdok {
@@ -1535,7 +1573,7 @@ func (t *gdbThread) reloadRegisters() error {
 
 	switch t.p.bi.GOOS {
 	case "linux":
-		if reg, hasFsBase := t.regs.regs[regnameFsBase]; hasFsBase {
+		if reg, hasFsBase := t.regs.regs[t.p.regnames.FsBase]; hasFsBase {
 			t.regs.gaddr = 0
 			t.regs.tls = binary.LittleEndian.Uint64(reg.value)
 			t.regs.hasgaddr = false
@@ -1622,11 +1660,11 @@ func (t *gdbThread) reloadGAtPC() error {
 	// Additionally all breakpoints in [pc, pc+len(movinstr)] need to be removed
 	for addr := range t.p.breakpoints.M {
 		if addr >= pc && addr <= pc+uint64(len(movinstr)) {
-			err := t.p.conn.clearBreakpoint(addr)
+			err := t.p.conn.clearBreakpoint(addr, t.p.breakpointKind)
 			if err != nil {
 				return err
 			}
-			defer t.p.conn.setBreakpoint(addr)
+			defer t.p.conn.setBreakpoint(addr, t.p.breakpointKind)
 		}
 	}
 
@@ -1648,7 +1686,7 @@ func (t *gdbThread) reloadGAtPC() error {
 		}
 		t.regs.setPC(pc)
 		t.regs.setCX(cx)
-		err1 := t.writeSomeRegisters(regnamePC, regnameCX)
+		err1 := t.writeSomeRegisters(t.p.regnames.PC, t.p.regnames.CX)
 		if err == nil {
 			err = err1
 		}
@@ -1665,7 +1703,7 @@ func (t *gdbThread) reloadGAtPC() error {
 		return err
 	}
 
-	if err := t.readSomeRegisters(regnamePC, regnameCX); err != nil {
+	if err := t.readSomeRegisters(t.p.regnames.PC, t.p.regnames.CX); err != nil {
 		return err
 	}
 
@@ -1692,7 +1730,7 @@ func (t *gdbThread) reloadGAlloc() error {
 	pc := t.regs.PC()
 
 	t.regs.setPC(t.p.loadGInstrAddr)
-	if err := t.writeSomeRegisters(regnamePC); err != nil {
+	if err := t.writeSomeRegisters(t.p.regnames.PC); err != nil {
 		return err
 	}
 
@@ -1701,7 +1739,7 @@ func (t *gdbThread) reloadGAlloc() error {
 	defer func() {
 		t.regs.setPC(pc)
 		t.regs.setCX(cx)
-		err1 := t.writeSomeRegisters(regnamePC, regnameCX)
+		err1 := t.writeSomeRegisters(t.p.regnames.PC, t.p.regnames.CX)
 		if err == nil {
 			err = err1
 		}
@@ -1718,7 +1756,7 @@ func (t *gdbThread) reloadGAlloc() error {
 		return err
 	}
 
-	if err := t.readSomeRegisters(regnameCX); err != nil {
+	if err := t.readSomeRegisters(t.p.regnames.CX); err != nil {
 		return err
 	}
 
@@ -1761,27 +1799,27 @@ func (t *gdbThread) SetCurrentBreakpoint(adjustPC bool) error {
 }
 
 func (regs *gdbRegisters) PC() uint64 {
-	return binary.LittleEndian.Uint64(regs.regs[regnamePC].value)
+	return binary.LittleEndian.Uint64(regs.regs[regs.regnames.PC].value)
 }
 
 func (regs *gdbRegisters) setPC(value uint64) {
-	binary.LittleEndian.PutUint64(regs.regs[regnamePC].value, value)
+	binary.LittleEndian.PutUint64(regs.regs[regs.regnames.PC].value, value)
 }
 
 func (regs *gdbRegisters) SP() uint64 {
-	return binary.LittleEndian.Uint64(regs.regs[regnameSP].value)
+	return binary.LittleEndian.Uint64(regs.regs[regs.regnames.SP].value)
 }
 
 func (regs *gdbRegisters) BP() uint64 {
-	return binary.LittleEndian.Uint64(regs.regs[regnameBP].value)
+	return binary.LittleEndian.Uint64(regs.regs[regs.regnames.BP].value)
 }
 
 func (regs *gdbRegisters) CX() uint64 {
-	return binary.LittleEndian.Uint64(regs.regs[regnameCX].value)
+	return binary.LittleEndian.Uint64(regs.regs[regs.regnames.CX].value)
 }
 
 func (regs *gdbRegisters) setCX(value uint64) {
-	binary.LittleEndian.PutUint64(regs.regs[regnameCX].value, value)
+	binary.LittleEndian.PutUint64(regs.regs[regs.regnames.CX].value, value)
 }
 
 func (regs *gdbRegisters) TLS() uint64 {
@@ -1800,375 +1838,6 @@ func (regs *gdbRegisters) byName(name string) uint64 {
 	return binary.LittleEndian.Uint64(reg.value)
 }
 
-func (regs *gdbRegisters) Get(n int) (uint64, error) {
-	const (
-		mask8  = 0xff
-		mask16 = 0xffff
-		mask32 = 0xffffffff
-	)
-
-	if regs.arch.Name == "arm64" {
-		reg := arm64asm.Reg(n)
-
-		switch reg {
-		// 64-bit
-		case arm64asm.X0:
-			return regs.byName("x0"), nil
-		case arm64asm.X1:
-			return regs.byName("x1"), nil
-		case arm64asm.X2:
-			return regs.byName("x2"), nil
-		case arm64asm.X3:
-			return regs.byName("x3"), nil
-		case arm64asm.X4:
-			return regs.byName("x4"), nil
-		case arm64asm.X5:
-			return regs.byName("x5"), nil
-		case arm64asm.X6:
-			return regs.byName("x6"), nil
-		case arm64asm.X7:
-			return regs.byName("x7"), nil
-		case arm64asm.X8:
-			return regs.byName("x8"), nil
-		case arm64asm.X9:
-			return regs.byName("x9"), nil
-		case arm64asm.X10:
-			return regs.byName("x10"), nil
-		case arm64asm.X11:
-			return regs.byName("x11"), nil
-		case arm64asm.X12:
-			return regs.byName("x12"), nil
-		case arm64asm.X13:
-			return regs.byName("x13"), nil
-		case arm64asm.X14:
-			return regs.byName("x14"), nil
-		case arm64asm.X15:
-			return regs.byName("x15"), nil
-		case arm64asm.X16:
-			return regs.byName("x16"), nil
-		case arm64asm.X17:
-			return regs.byName("x17"), nil
-		case arm64asm.X18:
-			return regs.byName("x18"), nil
-		case arm64asm.X19:
-			return regs.byName("x19"), nil
-		case arm64asm.X20:
-			return regs.byName("x20"), nil
-		case arm64asm.X21:
-			return regs.byName("x21"), nil
-		case arm64asm.X22:
-			return regs.byName("x22"), nil
-		case arm64asm.X23:
-			return regs.byName("x23"), nil
-		case arm64asm.X24:
-			return regs.byName("x24"), nil
-		case arm64asm.X25:
-			return regs.byName("x25"), nil
-		case arm64asm.X26:
-			return regs.byName("x26"), nil
-		case arm64asm.X27:
-			return regs.byName("x27"), nil
-		case arm64asm.X28:
-			return regs.byName("x28"), nil
-		case arm64asm.X29:
-			return regs.byName("fp"), nil
-		case arm64asm.X30:
-			return regs.byName("lr"), nil
-		case arm64asm.SP:
-			return regs.byName("sp"), nil
-		}
-
-		// 64-bit
-		switch reg {
-		case arm64asm.W0:
-			return regs.byName("w0"), nil
-		case arm64asm.W1:
-			return regs.byName("w1"), nil
-		case arm64asm.W2:
-			return regs.byName("w2"), nil
-		case arm64asm.W3:
-			return regs.byName("w3"), nil
-		case arm64asm.W4:
-			return regs.byName("w4"), nil
-		case arm64asm.W5:
-			return regs.byName("w5"), nil
-		case arm64asm.W6:
-			return regs.byName("w6"), nil
-		case arm64asm.W7:
-			return regs.byName("w7"), nil
-		case arm64asm.W8:
-			return regs.byName("w8"), nil
-		case arm64asm.W9:
-			return regs.byName("w9"), nil
-		case arm64asm.W10:
-			return regs.byName("w10"), nil
-		case arm64asm.W11:
-			return regs.byName("w11"), nil
-		case arm64asm.W12:
-			return regs.byName("w12"), nil
-		case arm64asm.W13:
-			return regs.byName("w13"), nil
-		case arm64asm.W14:
-			return regs.byName("w14"), nil
-		case arm64asm.W15:
-			return regs.byName("w15"), nil
-		case arm64asm.W16:
-			return regs.byName("w16"), nil
-		case arm64asm.W17:
-			return regs.byName("w17"), nil
-		case arm64asm.W18:
-			return regs.byName("w18"), nil
-		case arm64asm.W19:
-			return regs.byName("w19"), nil
-		case arm64asm.W20:
-			return regs.byName("w20"), nil
-		case arm64asm.W21:
-			return regs.byName("w21"), nil
-		case arm64asm.W22:
-			return regs.byName("w22"), nil
-		case arm64asm.W23:
-			return regs.byName("w23"), nil
-		case arm64asm.W24:
-			return regs.byName("w24"), nil
-		case arm64asm.W25:
-			return regs.byName("w25"), nil
-		case arm64asm.W26:
-			return regs.byName("w26"), nil
-		case arm64asm.W27:
-			return regs.byName("w27"), nil
-		case arm64asm.W28:
-			return regs.byName("w28"), nil
-			// TODO: not sure about these ones, they are not returned by debugserver
-			// probably need to take the x-register and bitmask them
-			/*case arm64asm.W29:
-				return regs.byName("w29"), nil
-			case arm64asm.W30:
-				return regs.byName("w30"), nil
-				/*case arm64asm.WSP:
-				return regs.byName("wsp"), nil*/
-		}
-
-		// vector registers
-		// 64-bit
-		switch reg {
-		case arm64asm.V0:
-			return regs.byName("v0"), nil
-		case arm64asm.V1:
-			return regs.byName("v1"), nil
-		case arm64asm.V2:
-			return regs.byName("v2"), nil
-		case arm64asm.V3:
-			return regs.byName("v3"), nil
-		case arm64asm.V4:
-			return regs.byName("v4"), nil
-		case arm64asm.V5:
-			return regs.byName("v5"), nil
-		case arm64asm.V6:
-			return regs.byName("v6"), nil
-		case arm64asm.V7:
-			return regs.byName("v7"), nil
-		case arm64asm.V8:
-			return regs.byName("v8"), nil
-		case arm64asm.V9:
-			return regs.byName("v9"), nil
-		case arm64asm.V10:
-			return regs.byName("v10"), nil
-		case arm64asm.V11:
-			return regs.byName("v11"), nil
-		case arm64asm.V12:
-			return regs.byName("v12"), nil
-		case arm64asm.V13:
-			return regs.byName("v13"), nil
-		case arm64asm.V14:
-			return regs.byName("v14"), nil
-		case arm64asm.V15:
-			return regs.byName("v15"), nil
-		case arm64asm.V16:
-			return regs.byName("v16"), nil
-		case arm64asm.V17:
-			return regs.byName("v17"), nil
-		case arm64asm.V18:
-			return regs.byName("v18"), nil
-		case arm64asm.V19:
-			return regs.byName("v19"), nil
-		case arm64asm.V20:
-			return regs.byName("v20"), nil
-		case arm64asm.V21:
-			return regs.byName("v21"), nil
-		case arm64asm.V22:
-			return regs.byName("v22"), nil
-		case arm64asm.V23:
-			return regs.byName("v23"), nil
-		case arm64asm.V24:
-			return regs.byName("v24"), nil
-		case arm64asm.V25:
-			return regs.byName("v25"), nil
-		case arm64asm.V26:
-			return regs.byName("v26"), nil
-		case arm64asm.V27:
-			return regs.byName("v27"), nil
-		case arm64asm.V28:
-			return regs.byName("v28"), nil
-		case arm64asm.V29:
-			return regs.byName("v29"), nil
-		case arm64asm.V30:
-			return regs.byName("v30"), nil
-		case arm64asm.V31:
-			return regs.byName("v31"), nil
-		}
-	} else {
-		reg := x86asm.Reg(n)
-
-		switch reg {
-		// 8-bit
-		case x86asm.AL:
-			return regs.byName("rax") & mask8, nil
-		case x86asm.CL:
-			return regs.byName("rcx") & mask8, nil
-		case x86asm.DL:
-			return regs.byName("rdx") & mask8, nil
-		case x86asm.BL:
-			return regs.byName("rbx") & mask8, nil
-		case x86asm.AH:
-			return (regs.byName("rax") >> 8) & mask8, nil
-		case x86asm.CH:
-			return (regs.byName("rcx") >> 8) & mask8, nil
-		case x86asm.DH:
-			return (regs.byName("rdx") >> 8) & mask8, nil
-		case x86asm.BH:
-			return (regs.byName("rbx") >> 8) & mask8, nil
-		case x86asm.SPB:
-			return regs.byName("rsp") & mask8, nil
-		case x86asm.BPB:
-			return regs.byName("rbp") & mask8, nil
-		case x86asm.SIB:
-			return regs.byName("rsi") & mask8, nil
-		case x86asm.DIB:
-			return regs.byName("rdi") & mask8, nil
-		case x86asm.R8B:
-			return regs.byName("r8") & mask8, nil
-		case x86asm.R9B:
-			return regs.byName("r9") & mask8, nil
-		case x86asm.R10B:
-			return regs.byName("r10") & mask8, nil
-		case x86asm.R11B:
-			return regs.byName("r11") & mask8, nil
-		case x86asm.R12B:
-			return regs.byName("r12") & mask8, nil
-		case x86asm.R13B:
-			return regs.byName("r13") & mask8, nil
-		case x86asm.R14B:
-			return regs.byName("r14") & mask8, nil
-		case x86asm.R15B:
-			return regs.byName("r15") & mask8, nil
-
-		// 16-bit
-		case x86asm.AX:
-			return regs.byName("rax") & mask16, nil
-		case x86asm.CX:
-			return regs.byName("rcx") & mask16, nil
-		case x86asm.DX:
-			return regs.byName("rdx") & mask16, nil
-		case x86asm.BX:
-			return regs.byName("rbx") & mask16, nil
-		case x86asm.SP:
-			return regs.byName("rsp") & mask16, nil
-		case x86asm.BP:
-			return regs.byName("rbp") & mask16, nil
-		case x86asm.SI:
-			return regs.byName("rsi") & mask16, nil
-		case x86asm.DI:
-			return regs.byName("rdi") & mask16, nil
-		case x86asm.R8W:
-			return regs.byName("r8") & mask16, nil
-		case x86asm.R9W:
-			return regs.byName("r9") & mask16, nil
-		case x86asm.R10W:
-			return regs.byName("r10") & mask16, nil
-		case x86asm.R11W:
-			return regs.byName("r11") & mask16, nil
-		case x86asm.R12W:
-			return regs.byName("r12") & mask16, nil
-		case x86asm.R13W:
-			return regs.byName("r13") & mask16, nil
-		case x86asm.R14W:
-			return regs.byName("r14") & mask16, nil
-		case x86asm.R15W:
-			return regs.byName("r15") & mask16, nil
-
-		// 32-bit
-		case x86asm.EAX:
-			return regs.byName("rax") & mask32, nil
-		case x86asm.ECX:
-			return regs.byName("rcx") & mask32, nil
-		case x86asm.EDX:
-			return regs.byName("rdx") & mask32, nil
-		case x86asm.EBX:
-			return regs.byName("rbx") & mask32, nil
-		case x86asm.ESP:
-			return regs.byName("rsp") & mask32, nil
-		case x86asm.EBP:
-			return regs.byName("rbp") & mask32, nil
-		case x86asm.ESI:
-			return regs.byName("rsi") & mask32, nil
-		case x86asm.EDI:
-			return regs.byName("rdi") & mask32, nil
-		case x86asm.R8L:
-			return regs.byName("r8") & mask32, nil
-		case x86asm.R9L:
-			return regs.byName("r9") & mask32, nil
-		case x86asm.R10L:
-			return regs.byName("r10") & mask32, nil
-		case x86asm.R11L:
-			return regs.byName("r11") & mask32, nil
-		case x86asm.R12L:
-			return regs.byName("r12") & mask32, nil
-		case x86asm.R13L:
-			return regs.byName("r13") & mask32, nil
-		case x86asm.R14L:
-			return regs.byName("r14") & mask32, nil
-		case x86asm.R15L:
-			return regs.byName("r15") & mask32, nil
-
-		// 64-bit
-		case x86asm.RAX:
-			return regs.byName("rax"), nil
-		case x86asm.RCX:
-			return regs.byName("rcx"), nil
-		case x86asm.RDX:
-			return regs.byName("rdx"), nil
-		case x86asm.RBX:
-			return regs.byName("rbx"), nil
-		case x86asm.RSP:
-			return regs.byName("rsp"), nil
-		case x86asm.RBP:
-			return regs.byName("rbp"), nil
-		case x86asm.RSI:
-			return regs.byName("rsi"), nil
-		case x86asm.RDI:
-			return regs.byName("rdi"), nil
-		case x86asm.R8:
-			return regs.byName("r8"), nil
-		case x86asm.R9:
-			return regs.byName("r9"), nil
-		case x86asm.R10:
-			return regs.byName("r10"), nil
-		case x86asm.R11:
-			return regs.byName("r11"), nil
-		case x86asm.R12:
-			return regs.byName("r12"), nil
-		case x86asm.R13:
-			return regs.byName("r13"), nil
-		case x86asm.R14:
-			return regs.byName("r14"), nil
-		case x86asm.R15:
-			return regs.byName("r15"), nil
-		}
-	}
-
-	return 0, proc.ErrUnknownRegister
-}
-
 func (r *gdbRegisters) FloatLoadError() error {
 	return nil
 }
@@ -2180,14 +1849,13 @@ func (t *gdbThread) setPC(pc uint64) error {
 	if t.p.gcmdok {
 		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
 	}
-	reg := t.regs.regs[regnamePC]
+	reg := t.regs.regs[t.regs.regnames.PC]
 	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
 }
 
 // SetReg will change the value of a list of registers
 func (t *gdbThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
-	regName, _, _ := t.p.bi.Arch.DwarfRegisterToString(int(regNum), nil)
-	regName = strings.ToLower(regName)
+	regName := registerName(t.p.bi.Arch, regNum)
 	_, _ = t.Registers() // Registers must be loaded first
 	gdbreg, ok := t.regs.regs[regName]
 	if !ok && strings.HasPrefix(regName, "xmm") {
@@ -2261,7 +1929,12 @@ func (regs *gdbRegisters) Slice(floatingPoint bool) ([]proc.Register, error) {
 
 func (regs *gdbRegisters) Copy() (proc.Registers, error) {
 	savedRegs := &gdbRegisters{}
-	savedRegs.init(regs.regsInfo, regs.arch)
+	savedRegs.init(regs.regsInfo, regs.arch, regs.regnames)
 	copy(savedRegs.buf, regs.buf)
 	return savedRegs, nil
+}
+
+func registerName(arch *proc.Arch, regNum uint64) string {
+	regName, _, _ := arch.DwarfRegisterToString(int(regNum), nil)
+	return strings.ToLower(regName)
 }
