@@ -11,7 +11,7 @@
 // The protocol is specified at:
 //   https://sourceware.org/gdb/onlinedocs/gdb/Remote-Protocol.html
 // with additional documentation for lldb specific extensions described at:
-//   https://github.com/llvm-mirror/lldb/blob/master/docs/lldb-gdb-remote.txt
+//   https://github.com/llvm/llvm-project/blob/main/lldb/docs/lldb-gdb-remote.txt
 //
 // Terminology:
 //  * inferior: the program we are trying to debug
@@ -81,7 +81,9 @@ import (
 	"github.com/go-delve/delve/pkg/elfwriter"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 	"github.com/go-delve/delve/pkg/proc/linutil"
+	"github.com/go-delve/delve/pkg/proc/macutil"
 	isatty "github.com/mattn/go-isatty"
 )
 
@@ -202,6 +204,8 @@ type gdbRegisters struct {
 type gdbRegister struct {
 	value  []byte
 	regnum int
+
+	ignoreOnWrite bool
 }
 
 // gdbRegname records names of important CPU registers
@@ -319,26 +323,19 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 		return nil, err
 	}
 
-	if verbuf, err := p.conn.exec([]byte("$qGDBServerVersion"), "init"); err == nil {
-		for _, v := range strings.Split(string(verbuf), ";") {
-			if strings.HasPrefix(v, "version:") {
-				if v[len("version:"):] == "902" {
-					// Workaround for https://bugs.llvm.org/show_bug.cgi?id=36968, 'g' command crashes a version of debugserver on some systems (?)
-					p.gcmdok = false
-					break
-				}
-
-				// Workaround for darwin arm64. Apple's debugserver seems to have a problem
-				// with not selecting the correct thread in the 'g' command and the returned
-				// registers are empty / an E74 error is thrown. This was reported to LLVM
-				// as https://bugs.llvm.org/show_bug.cgi?id=50169
-				version, err := strconv.ParseInt(v[len("version:"):], 10, 32)
-
-				if err == nil && version >= 1200 && version <= 1205 && p.bi.Arch.Name == "arm64" {
-					p.gcmdok = false
-				}
-			}
-		}
+	if p.conn.isDebugserver {
+		// There are multiple problems with the 'g'/'G' commands on debugserver.
+		// On version 902 it used to crash the server completely (https://bugs.llvm.org/show_bug.cgi?id=36968),
+		// on arm64 it results in E74 being returned (https://bugs.llvm.org/show_bug.cgi?id=50169)
+		// and on systems where AVX-512 is used it returns the floating point
+		// registers scrambled and sometimes causes the mask registers to be
+		// zeroed out (https://github.com/go-delve/delve/pull/2498).
+		// All of these bugs stem from the fact that the main consumer of
+		// debugserver, lldb, never uses 'g' or 'G' which would make Delve the
+		// sole tester of those codepaths.
+		// Therefore we disable it here. The associated code is kept around to be
+		// used with Mozilla RR.
+		p.gcmdok = false
 	}
 
 	tgt, err := p.initialize(path, debugInfoDirs, stopReason)
@@ -363,6 +360,18 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 	}
 
 	return tgt, nil
+}
+
+func (p *gdbProcess) SupportsBPF() bool {
+	return false
+}
+
+func (dbp *gdbProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+	return nil
+}
+
+func (dbp *gdbProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	panic("not implemented")
 }
 
 // unusedPort returns an unused tcp port
@@ -399,7 +408,7 @@ func getDebugServerAbsolutePath() string {
 
 func canUnmaskSignals(debugServerExecutable string) bool {
 	checkCanUnmaskSignalsOnce.Do(func() {
-		buf, _ := exec.Command(debugServerExecutable, "--unmask-singals").CombinedOutput()
+		buf, _ := exec.Command(debugServerExecutable, "--unmask-signals").CombinedOutput()
 		canUnmaskSignalsCached = !strings.Contains(string(buf), "unrecognized option")
 	})
 	return canUnmaskSignalsCached
@@ -435,6 +444,9 @@ func getLdEnvVars() []string {
 func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
+	}
+	if err := macutil.CheckRosetta(); err != nil {
+		return nil, err
 	}
 
 	foreground := flags&proc.LaunchForeground != 0
@@ -552,6 +564,9 @@ func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs [
 func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.Target, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
+	}
+	if err := macutil.CheckRosetta(); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -814,8 +829,9 @@ continueLoop:
 		if err != nil {
 			if _, exited := err.(proc.ErrProcessExited); exited {
 				p.exited = true
+				return nil, proc.StopExited, err
 			}
-			return nil, proc.StopExited, err
+			return nil, proc.StopUnknown, err
 		}
 
 		// For stubs that support qThreadStopInfo updateThreadList will
@@ -894,7 +910,7 @@ func (p *gdbProcess) findThreadByStrID(threadID string) *gdbThread {
 // and returns true if we should stop execution in response to one of the
 // signals and return control to the user.
 // Adjusts trapthread to a thread that we actually want to stop at.
-func (p *gdbProcess) handleThreadSignals(trapthread *gdbThread) (trapthreadOut *gdbThread, atstart bool, shouldStop bool) {
+func (p *gdbProcess) handleThreadSignals(trapthread *gdbThread) (trapthreadOut *gdbThread, atstart, shouldStop bool) {
 	var trapthreadCandidate *gdbThread
 
 	for _, th := range p.threads {
@@ -1182,7 +1198,7 @@ func (p *gdbProcess) ChangeDirection(dir proc.Direction) error {
 	if p.conn.direction == dir {
 		return nil
 	}
-	if p.Breakpoints().HasInternalBreakpoints() {
+	if p.Breakpoints().HasSteppingBreakpoints() {
 		return ErrDirChange
 	}
 	p.conn.direction = dir
@@ -1541,7 +1557,7 @@ func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch, regn
 	}
 	regs.buf = make([]byte, regsz)
 	for _, reginfo := range regsInfo {
-		regs.regs[reginfo.Name] = gdbRegister{regnum: reginfo.Regnum, value: regs.buf[reginfo.Offset : reginfo.Offset+reginfo.Bitsize/8]}
+		regs.regs[reginfo.Name] = gdbRegister{regnum: reginfo.Regnum, value: regs.buf[reginfo.Offset : reginfo.Offset+reginfo.Bitsize/8], ignoreOnWrite: reginfo.ignoreOnWrite}
 	}
 }
 
@@ -1556,7 +1572,8 @@ func (t *gdbThread) reloadRegisters() error {
 
 	if t.p.gcmdok {
 		if err := t.p.conn.readRegisters(t.strID, t.regs.buf); err != nil {
-			if isProtocolErrorUnsupported(err) {
+			gdberr, isProt := err.(*GdbProtocolError)
+			if isProtocolErrorUnsupported(err) || (t.p.conn.isDebugserver && isProt && gdberr.code == "E74") {
 				t.p.gcmdok = false
 			} else {
 				return err
@@ -1571,8 +1588,7 @@ func (t *gdbThread) reloadRegisters() error {
 		}
 	}
 
-	switch t.p.bi.GOOS {
-	case "linux":
+	if t.p.bi.GOOS == "linux" {
 		if reg, hasFsBase := t.regs.regs[t.p.regnames.FsBase]; hasFsBase {
 			t.regs.gaddr = 0
 			t.regs.tls = binary.LittleEndian.Uint64(reg.value)
@@ -1615,6 +1631,9 @@ func (t *gdbThread) writeRegisters() error {
 		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
 	}
 	for _, r := range t.regs.regs {
+		if r.ignoreOnWrite {
+			continue
+		}
 		if err := t.p.conn.writeRegister(t.strID, r.regnum, r.value); err != nil {
 			return err
 		}
@@ -1787,13 +1806,7 @@ func (t *gdbThread) SetCurrentBreakpoint(adjustPC bool) error {
 				return err
 			}
 		}
-		t.CurrentBreakpoint = bp.CheckCondition(t)
-		if t.CurrentBreakpoint.Breakpoint != nil && t.CurrentBreakpoint.Active {
-			if g, err := proc.GetG(t); err == nil {
-				t.CurrentBreakpoint.HitCount[g.ID]++
-			}
-			t.CurrentBreakpoint.TotalHitCount++
-		}
+		t.CurrentBreakpoint.Breakpoint = bp
 	}
 	return nil
 }
@@ -1860,8 +1873,11 @@ func (t *gdbThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
 	gdbreg, ok := t.regs.regs[regName]
 	if !ok && strings.HasPrefix(regName, "xmm") {
 		// XMMn and YMMn are the same amd64 register (in different sizes), if we
-		// don't find XMMn try YMMn instead.
+		// don't find XMMn try YMMn or ZMMn instead.
 		gdbreg, ok = t.regs.regs["y"+regName[1:]]
+		if !ok {
+			gdbreg, ok = t.regs.regs["z"+regName[1:]]
+		}
 	}
 	if !ok {
 		return fmt.Errorf("could not set register %s: not found", regName)
@@ -1920,8 +1936,16 @@ func (regs *gdbRegisters) Slice(floatingPoint bool) ([]proc.Register, error) {
 
 			value := regs.regs[reginfo.Name].value
 			xmmName := "x" + reginfo.Name[1:]
-			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value[:16])
-			r = proc.AppendBytesRegister(r, strings.ToUpper(reginfo.Name), value[16:])
+			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value)
+
+		case reginfo.Bitsize == 512:
+			if !strings.HasPrefix(strings.ToLower(reginfo.Name), "zmm") || !floatingPoint {
+				continue
+			}
+
+			value := regs.regs[reginfo.Name].value
+			xmmName := "x" + reginfo.Name[1:]
+			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value)
 		}
 	}
 	return r, nil
