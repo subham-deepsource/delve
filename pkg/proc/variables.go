@@ -2382,9 +2382,7 @@ func (cm constantsMap) Get(typ godwarf.Type) *constantType {
 		ctyp.initialized = true
 		sort.Sort(constantValuesByValue(ctyp.values))
 		for i := range ctyp.values {
-			if strings.HasPrefix(ctyp.values[i].name, typepkg) {
-				ctyp.values[i].name = ctyp.values[i].name[len(typepkg):]
-			}
+			ctyp.values[i].name = strings.TrimPrefix(ctyp.values[i].name, typepkg)
 			if popcnt(uint64(ctyp.values[i].value)) == 1 {
 				ctyp.values[i].singleBit = true
 			}
