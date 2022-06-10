@@ -1900,11 +1900,10 @@ func TestIssue414(t *testing.T) {
 			} else {
 				err = p.Next()
 			}
-			if err != nil {
-				if _, exited := err.(proc.ErrProcessExited); exited {
-					break
-				}
+			if _, exited := err.(proc.ErrProcessExited); exited {
+				break
 			}
+
 			assertNoError(err, t, "Step()")
 		}
 	})
